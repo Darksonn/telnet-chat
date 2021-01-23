@@ -1,23 +1,119 @@
 use std::io;
+use std::net::SocketAddr;
 
-use tokio::{try_join, select};
-use tokio::sync::mpsc::{unbounded_channel, Receiver, UnboundedSender, UnboundedReceiver};
-use tokio::net::{TcpStream, tcp::{ReadHalf, WriteHalf}};
-use tokio::stream::StreamExt;
+use futures::stream::StreamExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, tcp::{ReadHalf, WriteHalf}};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use tokio::sync::mpsc::{channel, Sender, Receiver};
+use tokio::sync::oneshot;
+use tokio::{try_join, select};
+use tokio::task::JoinHandle;
 use tokio_util::codec::FramedRead;
 
-use crate::{ClientId, ServerHandle, ToServer, FromServer};
+use crate::ClientId;
+use crate::main_loop::{ServerHandle, ToServer};
 use crate::telnet::{TelnetCodec, Item};
 
-pub struct ClientData {
+/// Messages received from the main loop.
+pub enum FromServer {
+    Message(Vec<u8>),
+}
+
+/// A handle to this actor, used by the server.
+#[derive(Debug)]
+pub struct ClientHandle {
     pub id: ClientId,
-    pub recv: Receiver<FromServer>,
+    ip: SocketAddr,
+    chan: Sender<FromServer>,
+    kill: JoinHandle<()>,
+}
+
+impl ClientHandle {
+    /// Send a message to this client actor. Will emit an error if sending does
+    /// not succeed immediately, as this means that forwarding messages to the
+    /// tcp connection cannot keep up.
+    pub fn send(&mut self, msg: FromServer) -> Result<(), io::Error> {
+        if self.chan.try_send(msg).is_err() {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "Can't keep up or dead"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Kill the actor.
+    pub fn kill(self) {
+        // run the destructor
+        drop(self);
+    }
+}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        self.kill.abort()
+    }
+}
+
+/// This struct is constructed by the accept loop and used as the argument to
+/// `spawn_client`.
+pub struct ClientInfo {
+    pub ip: SocketAddr,
+    pub id: ClientId,
     pub handle: ServerHandle,
     pub tcp: TcpStream,
 }
 
-pub async fn start_client(data: ClientData) {
+/// This struct stores the information used internally by this client actor.
+struct ClientData {
+    id: ClientId,
+    handle: ServerHandle,
+    recv: Receiver<FromServer>,
+    tcp: TcpStream,
+}
+
+/// Spawn a new client actor.
+pub fn spawn_client(info: ClientInfo) {
+    let (send, recv) = channel(64);
+
+    let data = ClientData {
+        id: info.id,
+        handle: info.handle.clone(),
+        tcp: info.tcp,
+        recv,
+    };
+
+    // This spawns the new task.
+    let (my_send, my_recv) = oneshot::channel();
+    let kill = tokio::spawn(start_client(my_recv, data));
+
+    // Then we create a ClientHandle to this new task, and use the oneshot
+    // channel to send it to the task.
+    let handle = ClientHandle {
+        id: info.id,
+        ip: info.ip,
+        chan: send,
+        kill,
+    };
+
+    // Ignore send errors here. Should only happen if the server is shutting
+    // down.
+    let _ = my_send.send(handle);
+}
+
+async fn start_client(my_handle: oneshot::Receiver<ClientHandle>, mut data: ClientData) {
+    // Wait for `spawn_client` to send us the `ClientHandle` so we can forward
+    // it to the main loop. We need the oneshot channel because we cannot
+    // otherwise get the `JoinHandle` returned by `tokio::spawn`. We forward it
+    // from here instead of in `spawn_client` because we want the server to see
+    // the NewClient message before this actor starts sending other messages.
+    let my_handle = match my_handle.await {
+        Ok(my_handle) => my_handle,
+        Err(_) => return,
+    };
+    data.handle.send(ToServer::NewClient(my_handle)).await;
+
+    // We sent the client handle to the main loop. Start talking to the tcp
+    // connection.
     let res = client_loop(data).await;
     match res {
         Ok(()) => {},
@@ -27,6 +123,7 @@ pub async fn start_client(data: ClientData) {
     }
 }
 
+/// This method performs the actual job of running the client actor.
 async fn client_loop(mut data: ClientData) -> Result<(), io::Error> {
     let (read, write) = data.tcp.split();
 
@@ -37,6 +134,8 @@ async fn client_loop(mut data: ClientData) -> Result<(), io::Error> {
         tcp_read(data.id, read, data.handle, send),
         tcp_write(write, data.recv, recv),
     }?;
+
+    let _ = data.tcp.shutdown().await;
 
     Ok(())
 }

@@ -46,7 +46,7 @@ impl Decoder for TelnetCodec {
             }
 
             if src[0] == 0xff {
-                let (res, consume) = try_parse_iac(src.bytes());
+                let (res, consume) = try_parse_iac(src.chunk());
                 src.advance(consume);
 
                 match res {
